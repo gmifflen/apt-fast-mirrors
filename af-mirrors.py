@@ -16,7 +16,8 @@ if sys.version_info < (3, 10):
     sys.exit("This script requires Python 3.10 or newer.")
 
 # prevents  localized output for commands
-os.environ['LC_ALL'] = "C"
+os.environ["LC_ALL"] = "C"
+
 
 def get_lsb_info():
     """gathers distribution information using the lsb_release command.
@@ -36,10 +37,13 @@ def get_lsb_info():
         print(f"Failed to get distribution information: {e}")
         sys.exit(1)
 
+
 # get distribution info
 lsb_info = get_lsb_info()
 distribution = lsb_info.get("Distributor ID", "Debian").lower()
-repo = lsb_info.get("Codename", "stable") # switched from testing to stable, cause it's solid
+repo = lsb_info.get(
+    "Codename", "stable"
+)  # switched from testing to stable, cause it's solid
 
 
 print("Searching for fastest mirrors...")
@@ -47,26 +51,30 @@ print("Searching for fastest mirrors...")
 # use netselect-apt to find fastest debian mirrors
 process = run(
     [
-        "/usr/bin/netselect-apt", repo, "-n", "-s",
-        "-o /etc/apt/sources.list.d/sources_stable.list"
+        "/usr/bin/netselect-apt",
+        repo,
+        "-n",
+        "-s",
+        "-o",
+        "/etc/apt/sources.list.d/sources_stable.list",
     ],
     text=True,
     stdout=PIPE,
     stderr=STDOUT,
-    env=os.environ
+    env=os.environ,
+)
 
 mirrors = []
 state = "fastest"
 
 # parse netselect-apt output for mirrors
-for line in p.stdout.readlines():
+for line in process.stdout.splitlines():
     if state == "fastest" and "fastest" in line:
         state = "http"
     elif state == "http":
         match = re.match("\s*(http\S+)", line)
         if match:
             mirrors.append(match.group(1))
-            print(match.group(1))
         elif "Of the hosts" in line:
             state = "finished"
 
@@ -84,43 +92,54 @@ def judge_mirror(entry):
     if entry is None:
         return entry, False
 
-    lead = entry.partition(',')[0].partition(' ')[0].rstrip('/')
+    lead = entry.partition(",")[0].partition(" ")[0].rstrip("/")
     if lead.endswith(distribution):
-        return (','.join(mirrors), True)
+        return (",".join(mirrors), True)
     return (entry, False)
 
 
 found_mirrors = False
-in_mirrors = False
-mirror_toks = []
-advert = '# Mirrors obtained from apt-fast-mirrors\n'
+new_content = []
+in_mirrors_section = False
+mirrors_updated = False
+advert = "# Mirrors obtained from apt-fast-mirrors\n"
 
-with fileinput.input("/etc/apt-fast.conf", inplace=True) as f:
-    for line in f:
-        if not in_mirrors:
-            tokens = line.split()
-            match tokens:
-                case ['MIRRORS', '=', '(']:
-                    if found_mirrors:
-                        sys.stderr.write("apt-fast.conf has than one MIRRORS.")
-                    found_mirrors = True
-                    in_mirrors = True
-                    print(advert, end='')
-                    print('MIRRORS=(', end='')
-                case _:
-                    print(line, end='')
-        else:
-            tokens = line.strip().split()
-            match tokens:
-                case [')']:
-                    in_mirrors = False
-                    print(' '.join(quote(judge_mirror(mirror)[0]) for mirror in mirror_toks) + ' )')
-                    mirror_toks = []
-                case _:
-                    mirror_toks.extend(tokens)
+# proccess apt-fast.conf
+for line in fileinput.input("/etc/apt-fast.conf", inplace=False):
+    stripped_line = line.strip()
+    if stripped_line.startswith("MIRRORS=(") and not mirrors_updated:
+        # found MIRRORS line
+        print("Updating MIRRORS in /etc/apt-fast.conf.")
 
-# if no MIRRORS was found in apt-fast.conf, append one to the end
+        in_mirrors_section = True
+        found_mirrors = True
+        new_content.append(advert)
+        new_content.append("MIRRORS=(")
+        new_content.append(" ".join(quote(mirror) for mirror in mirrors) + " )")
+        mirrors_updated = True
+    elif in_mirrors_section and stripped_line.endswith(")"):
+        # end of MIRRORS section; skip appending this line to prevent duplicate
+        in_mirrors_section = False
+        continue
+    elif not in_mirrors_section:
+        # for lines outside the MIRRORS section, add them to the new content as is
+        new_content.append(line.rstrip("\n"))
+
+# check if MIRRORS was found; if not, append it
 if not found_mirrors:
-    print("couldn't find MIRRORS var, appending one to the end")
-    with open("/etc/apt-fast.conf", "a") as myfile:
-        myfile.write(f'{advert}MIRRORS=({quote(",".join(mirrors))})')
+    print("MIRRORS not found. Adding it to /etc/apt-fast.conf.")
+    new_content.append(advert)
+    new_content.append(
+        "MIRRORS=(" + " ".join(quote(mirror) for mirror in mirrors) + " )"
+    )
+
+print("The following mirrors have been added to your MIRRORS:")
+for mirror in mirrors:
+    print(mirror)
+
+# rewrite the /etc/apt-fast.conf file with the updated content
+with open("/etc/apt-fast.conf", "w") as f:
+    for line in new_content:
+        print(line, file=f)
+
+print("Your /etc/apt-fast.conf has been successfully updated.")
