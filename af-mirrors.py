@@ -54,7 +54,8 @@ process = run(
     stdout=PIPE,
     stderr=STDOUT,
     env=os.environ
-
+)
+    
 mirrors = []
 state = "fastest"
 
