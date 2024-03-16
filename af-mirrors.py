@@ -1,42 +1,64 @@
 #!/usr/bin/env python3
 
-from subprocess import Popen, PIPE, STDOUT
+from subprocess import run, PIPE, STDOUT, check_output
 import os
-from shlex import shlex, quote
+from shlex import quote
 import sys
 import re
 import fileinput
-import lsb_release
 
+# ensure script is run with root privilages
 if not os.geteuid() == 0:
     sys.exit("\nOnly root can run this script\n")
 
-popen_args = {
-    "universal_newlines": True,
-    "stdout": PIPE,
-    "stderr": STDOUT,
-}
+# ensure the script is executed with Python 3.10 or newer.
+if sys.version_info < (3, 10):
+    sys.exit("This script requires Python 3.10 or newer.")
 
-# decide repo to use
-distribution = lsb_release.get_distro_information().get("ID", "debian")
-repo = lsb_release.get_distro_information().get("CODENAME", "testing")
+# prevents  localized output for commands
+os.environ['LC_ALL'] = "C"
 
-# Do not translate!
-environ = os.environ
-environ['LC_ALL'] = "C"
+def get_lsb_info():
+    """gathers distribution information using the lsb_release command.
+
+    Returns:
+        dict: contains keys 'Distributor ID' and 'Codename' with their respective values.
+    """
+    try:
+        output = check_output(["lsb_release", "-a"], text=True)
+        info = {}
+        for line in output.splitlines():
+            if ":" in line:
+                key, value = line.split(":", 1)
+                info[key.strip()] = value.strip()
+        return info
+    except Exception as e:
+        print(f"Failed to get distribution information: {e}")
+        sys.exit(1)
+
+# get distribution info
+lsb_info = get_lsb_info()
+distribution = lsb_info.get("Distributor ID", "Debian").lower()
+repo = lsb_info.get("Codename", "stable") # switched from testing to stable, cause it's solid
+
 
 print("Searching for fastest mirrors...")
-p = Popen(
+
+# use netselect-apt to find fastest debian mirrors
+process = run(
     [
         "/usr/bin/netselect-apt", repo, "-n", "-s",
-        "-o /etc/apt/sources.list.d/sources_testing.list"
+        "-o /etc/apt/sources.list.d/sources_stable.list"
     ],
-    **popen_args,
-    env=environ)
+    text=True,
+    stdout=PIPE,
+    stderr=STDOUT,
+    env=os.environ
 
 mirrors = []
 state = "fastest"
-#  while(True):
+
+# parse netselect-apt output for mirrors
 for line in p.stdout.readlines():
     if state == "fastest" and "fastest" in line:
         state = "http"
@@ -50,66 +72,55 @@ for line in p.stdout.readlines():
 
 
 def judge_mirror(entry):
-    """
-    Accept an entry, and depending on whether it looks like a mirror netselect would
-    know, replace it with the fastest mirror set or leave it alone.
+    """checks if an entry should be replaced with a list of mirrors.
+    if the entry is part of the distribution, it's replaced by the fastest mirrors.
+
+    Args:
+        entry (str): original mirror entry from the apt-fast configuration
+
+    Returns:
+        tuple: tuple containing the modified entry (if applicable) and a boolean indicating if a change was made
     """
     if entry is None:
-        return (entry, False)
+        return entry, False
 
-    # the members are separated by a comma or a quoted space
-    lead = entry.partition(',')[0].partition(' ')[0]
-    if lead.endswith('/'):
-        lead = lead[:-2]
+    lead = entry.partition(',')[0].partition(' ')[0].rstrip('/')
     if lead.endswith(distribution):
         return (','.join(mirrors), True)
-    else:
-        return (entry, False)
+    return (entry, False)
 
 
 found_mirrors = False
 in_mirrors = False
 mirror_toks = []
-advert = '# Mirrors found with sftl/af_mirrors.py\n'
+advert = '# Mirrors obtained from apt-fast-mirrors\n'
 
-for line in fileinput.input("/etc/apt-fast.conf", inplace=True):
-    # We try to parse it almost right with shlex.
-    ts = shlex(line, posix=True)
-    if not in_mirrors:
-        if ts.get_token() == 'MIRRORS' and ts.get_token(
-        ) == '=' and ts.get_token() == '(':
-            if found_mirrors == True:
-                sys.stderr.write("Got more than one MIRRORS?")
-
-            in_mirrors = True
-            found_mirrors = True
-
-            buf = advert + 'MIRRORS=('
-            mirror_entry = tokens.get_token()
-            mirror_entry, _ = judge_mirror(mirror_entry)
-            if mirror_entry is not None:
-                buf += quote(mirror_entry)
-            print(buf)
+with fileinput.input("/etc/apt-fast.conf", inplace=True) as f:
+    for line in f:
+        if not in_mirrors:
+            tokens = line.split()
+            match tokens:
+                case ['MIRRORS', '=', '(']:
+                    if found_mirrors:
+                        sys.stderr.write("apt-fast.conf has than one MIRRORS.")
+                    found_mirrors = True
+                    in_mirrors = True
+                    print(advert, end='')
+                    print('MIRRORS=(', end='')
+                case _:
+                    print(line, end='')
         else:
-            sys.stdout.write(line)
-            continue
-    else:
-        for tok in tokens:
-            if tok != ')':
-                mirror_toks.append(tok)
-            else:
-                # finish the buffer
-                sys.stdout.write(' '.join(
-                    quote(judge_mirror(m)[0]) for m in mirror_toks))
-                print(')')
-                mirror_toks = []
-                in_mirrors = False
+            tokens = line.strip().split()
+            match tokens:
+                case [')']:
+                    in_mirrors = False
+                    print(' '.join(quote(judge_mirror(mirror)[0]) for mirror in mirror_toks) + ' )')
+                    mirror_toks = []
+                case _:
+                    mirror_toks.extend(tokens)
 
+# if no MIRRORS was found in apt-fast.conf, append one to the end
 if not found_mirrors:
-    print("couldn't find MIRRORS var, adding at the end")
+    print("couldn't find MIRRORS var, appending one to the end")
     with open("/etc/apt-fast.conf", "a") as myfile:
-        myfile.write('{0}MIRRORS=({1})'.format(advert, quote(
-            ','.join(mirrors))))
-
-# unstable experimental
-# -o /home/stefan/sources_{0}.list
+        myfile.write(f'{advert}MIRRORS=({quote(",".join(mirrors))})')
